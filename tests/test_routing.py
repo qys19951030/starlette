@@ -4,6 +4,7 @@ import contextlib
 import functools
 import json
 import uuid
+import warnings
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Generator
 from typing import TypedDict
 
@@ -45,7 +46,7 @@ def disable_user(request: Request) -> Response:
     return Response(content, media_type="text/plain")
 
 
-def user_no_match(request: Request) -> Response:  # pragma: no cover
+def user_no_match(request: Request) -> Response:
     content = "User fixed no match"
     return Response(content, media_type="text/plain")
 
@@ -216,7 +217,8 @@ def test_router(client: TestClient) -> None:
 
     response = client.get("/users/nomatch")
     assert response.status_code == 200
-    assert response.text == "User nomatch"
+    # "/nomatch" is a static segment, so it takes precedence over "/{username}".
+    assert response.text == "User fixed no match"
 
     response = client.get("/static/123")
     assert response.status_code == 200
@@ -1180,3 +1182,243 @@ def test_paths_with_root_path(test_client_factory: TestClientFactory) -> None:
         "path": "/root/root-queue/path",
         "root_path": "/root",
     }
+
+
+def user_id(request: Request) -> Response:
+    return Response(f"user_id: {request.path_params['user_id']}", media_type="text/plain")
+
+
+def user_name(request: Request) -> Response:
+    return Response(f"user_name: {request.path_params['name']}", media_type="text/plain")
+
+
+def user_action(request: Request) -> Response:
+    return Response(f"action: {request.path_params['action']}", media_type="text/plain")
+
+
+def user_orders(request: Request) -> Response:
+    return Response(f"orders: {request.path_params['user_id']}", media_type="text/plain")
+
+
+def user_profile(request: Request) -> Response:
+    return Response(f"profile: {request.path_params['user_id']}", media_type="text/plain")
+
+
+def me_orders(request: Request) -> Response:
+    return Response("me orders", media_type="text/plain")
+
+
+def static_files(request: Request) -> Response:
+    return Response("static files", media_type="text/plain")
+
+
+async def websocket_lobby(session: WebSocket) -> None:
+    await session.accept()
+    await session.send_text("lobby")
+    await session.close()
+
+
+def test_static_segment_takes_precedence_over_param(test_client_factory: TestClientFactory) -> None:
+    router = Router(
+        routes=[
+            Route("/users/{user_id}", endpoint=user_id),
+            Route("/users/me", endpoint=user_me),
+            Route("/users/{user_id}/orders", endpoint=user_orders),
+        ]
+    )
+    assert router.routes == [
+        Route("/users/me", endpoint=user_me),
+        Route("/users/{user_id}", endpoint=user_id),
+        Route("/users/{user_id}/orders", endpoint=user_orders),
+    ]
+    client = test_client_factory(router)
+    response = client.get("/users/me")
+    assert response.status_code == 200
+    assert response.text == "User fixed me"
+    response = client.get("/users/42")
+    assert response.status_code == 200
+    assert response.text == "user_id: 42"
+    response = client.get("/users/42/orders")
+    assert response.status_code == 200
+    assert response.text == "orders: 42"
+
+
+def test_first_differing_segment_decides_precedence(test_client_factory: TestClientFactory) -> None:
+    router = Router(
+        routes=[
+            Route("/users/{user_id}/profile", endpoint=user_profile),
+            Route("/users/me/orders", endpoint=me_orders),
+        ]
+    )
+    assert router.routes == [
+        Route("/users/me/orders", endpoint=me_orders),
+        Route("/users/{user_id}/profile", endpoint=user_profile),
+    ]
+    client = test_client_factory(router)
+    response = client.get("/users/me/orders")
+    assert response.status_code == 200
+    assert response.text == "me orders"
+    response = client.get("/users/1/profile")
+    assert response.status_code == 200
+    assert response.text == "profile: 1"
+
+
+def test_convertor_param_takes_precedence_over_plain_param(test_client_factory: TestClientFactory) -> None:
+    router = Router(
+        routes=[
+            Route("/users/{action}", endpoint=user_action),
+            Route("/users/{user_id:int}", endpoint=user_id),
+        ]
+    )
+    assert router.routes == [
+        Route("/users/{user_id:int}", endpoint=user_id),
+        Route("/users/{action}", endpoint=user_action),
+    ]
+    client = test_client_factory(router)
+    response = client.get("/users/123")
+    assert response.status_code == 200
+    assert response.text == "user_id: 123"
+    response = client.get("/users/edit")
+    assert response.status_code == 200
+    assert response.text == "action: edit"
+
+
+def test_equal_specificity_routes_keep_registration_order() -> None:
+    routes = [
+        Route("/b/{param}", endpoint=user_id),
+        Route("/a/{param}", endpoint=user_id),
+        Route("/c/{param}", endpoint=user_id),
+    ]
+    router = Router(routes=routes)
+    assert router.routes == routes
+
+
+def test_mount_and_route_specificity(test_client_factory: TestClientFactory) -> None:
+    router = Router(
+        routes=[
+            Mount("/static", app=PlainTextResponse("static mount")),
+            Route("/static/files", endpoint=static_files),
+        ]
+    )
+    client = test_client_factory(router)
+    # The more specific route wins over the mount...
+    response = client.get("/static/files")
+    assert response.status_code == 200
+    assert response.text == "static files"
+    # ...while the mount still handles any other path below its prefix.
+    response = client.get("/static/image.png")
+    assert response.status_code == 200
+    assert response.text == "static mount"
+
+
+def test_overlapping_param_routes_warning() -> None:
+    with pytest.warns(UserWarning, match="same specificity"):
+        Router(
+            routes=[
+                Route("/users/{user_id}", endpoint=user_id),
+                Route("/users/{name}", endpoint=user_name),
+            ]
+        )
+
+
+def test_overlapping_param_routes_keep_registration_order(test_client_factory: TestClientFactory) -> None:
+    with pytest.warns(UserWarning, match="same specificity"):
+        router = Router(
+            routes=[
+                Route("/users/{user_id}", endpoint=user_id),
+                Route("/users/{name}", endpoint=user_name),
+            ]
+        )
+    client = test_client_factory(router)
+    response = client.get("/users/tom")
+    assert response.status_code == 200
+    assert response.text == "user_id: tom"
+
+    # Reversing the registration order reverses the matching order.
+    with pytest.warns(UserWarning, match="same specificity"):
+        router = Router(
+            routes=[
+                Route("/users/{name}", endpoint=user_name),
+                Route("/users/{user_id}", endpoint=user_id),
+            ]
+        )
+    client = test_client_factory(router)
+    response = client.get("/users/tom")
+    assert response.status_code == 200
+    assert response.text == "user_name: tom"
+
+
+def test_no_warning_for_non_overlapping_routes() -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        Router(
+            routes=[
+                Route("/users/me", endpoint=user_me),
+                Route("/users/{user_id}", endpoint=user_id),
+                Route("/users/{user_id}", endpoint=user_id, methods=["POST"]),
+                Route("/posts/{post_id}", endpoint=user_id),
+            ]
+        )
+
+
+def test_no_warning_when_match_argument_disambiguates() -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        Router(
+            routes=[
+                Route("/users/{user_id}", endpoint=user_id, match=1),
+                Route("/users/{name}", endpoint=user_name, match=2),
+            ]
+        )
+
+
+def test_match_argument_overrides_specificity(test_client_factory: TestClientFactory) -> None:
+    router = Router(
+        routes=[
+            Route("/users/me", endpoint=user_me, match=2),
+            Route("/users/{user_id}", endpoint=user_id, match=1),
+        ]
+    )
+    assert router.routes == [Route("/users/{user_id}", endpoint=user_id), Route("/users/me", endpoint=user_me)]
+    client = test_client_factory(router)
+    response = client.get("/users/me")
+    assert response.status_code == 200
+    assert response.text == "user_id: me"
+
+
+def test_mount_match_argument_overrides_specificity(test_client_factory: TestClientFactory) -> None:
+    router = Router(
+        routes=[
+            Route("/static/files", endpoint=static_files),
+            Mount("/static", app=PlainTextResponse("static mount"), match=-1),
+        ]
+    )
+    client = test_client_factory(router)
+    response = client.get("/static/files")
+    assert response.status_code == 200
+    assert response.text == "static mount"
+
+
+def test_websocket_route_specificity(test_client_factory: TestClientFactory) -> None:
+    router = Router(
+        routes=[
+            WebSocketRoute("/ws/{room}", endpoint=websocket_params),
+            WebSocketRoute("/ws/lobby", endpoint=websocket_lobby),
+        ]
+    )
+    client = test_client_factory(router)
+    with client.websocket_connect("/ws/lobby") as session:
+        assert session.receive_text() == "lobby"
+    with client.websocket_connect("/ws/other") as session:
+        assert session.receive_text() == "Hello, other!"
+
+
+def test_add_route_maintains_specificity_order(test_client_factory: TestClientFactory) -> None:
+    router = Router()
+    router.add_route("/users/{user_id}", endpoint=user_id)
+    router.add_route("/users/me", endpoint=user_me)
+    assert router.routes == [Route("/users/me", endpoint=user_me), Route("/users/{user_id}", endpoint=user_id)]
+    client = test_client_factory(router)
+    response = client.get("/users/me")
+    assert response.status_code == 200
+    assert response.text == "User fixed me"

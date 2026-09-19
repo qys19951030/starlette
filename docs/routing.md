@@ -255,24 +255,37 @@ url = request.url_for("sub:users:user_list", subdomain=...)
 
 ## Route priority
 
-Incoming paths are matched against each `Route` in order.
+Incoming paths are matched against each `Route` in order of specificity,
+so more specific routes are tried before general ones, regardless of the
+order in which they were registered.
 
-In cases where more that one route could match an incoming path, you should
-take care to ensure that more specific routes are listed before general cases.
+Routes are compared segment by segment, from left to right:
 
-For example:
+* Static segments are more specific than parameters, eg. `/users/me` wins over `/users/{username}`.
+* Parameters with a convertor are more specific than plain parameters, eg. `/users/{user_id:int}` wins over `/users/{user_id}`.
+* Otherwise, shorter paths are more specific than longer ones.
+
+Routes with equal specificity keep their registration order, and `Mount`
+instances take part in the same ordering, based on their path prefix.
 
 ```python
-# Don't do this: `/users/me` will never match incoming requests.
+# `/users/me` is matched first, even though it is registered last.
 routes = [
     Route('/users/{username}', user),
     Route('/users/me', current_user),
 ]
+```
 
-# Do this: `/users/me` is tested first.
+If two routes have the same specificity and their path patterns can match
+the same URL, a warning is raised when the router is created, since which
+one handles the request then depends on the registration order. You can
+disambiguate them explicitly with the `match` argument, which overrides
+the computed specificity. Lower values are matched first.
+
+```python
 routes = [
-    Route('/users/me', current_user),
-    Route('/users/{username}', user),
+    Route('/users/{username}', user, match=2),
+    Route('/users/{name}', other_user, match=1),  # Matched first.
 ]
 ```
 

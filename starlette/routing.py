@@ -203,12 +203,14 @@ class Route(BaseRoute):
         name: str | None = None,
         include_in_schema: bool = True,
         middleware: Sequence[Middleware] | None = None,
+        match: int | None = None,
     ) -> None:
         assert path.startswith("/"), "Routed paths must start with '/'"
         self.path = path
         self.endpoint = endpoint
         self.name = get_name(endpoint) if name is None else name
         self.include_in_schema = include_in_schema
+        self.match = match
 
         endpoint_handler = endpoint
         while isinstance(endpoint_handler, functools.partial):
@@ -298,11 +300,13 @@ class WebSocketRoute(BaseRoute):
         *,
         name: str | None = None,
         middleware: Sequence[Middleware] | None = None,
+        match: int | None = None,
     ) -> None:
         assert path.startswith("/"), "Routed paths must start with '/'"
         self.path = path
         self.endpoint = endpoint
         self.name = get_name(endpoint) if name is None else name
+        self.match = match
 
         endpoint_handler = endpoint
         while isinstance(endpoint_handler, functools.partial):
@@ -365,10 +369,12 @@ class Mount(BaseRoute):
         name: str | None = None,
         *,
         middleware: Sequence[Middleware] | None = None,
+        match: int | None = None,
     ) -> None:
         assert path == "" or path.startswith("/"), "Routed paths must start with '/'"
         assert app is not None or routes is not None, "Either 'app=...', or 'routes=' must be specified"
         self.path = path.rstrip("/")
+        self.match = match
         if app is not None:
             self._base_app: ASGIApp = app
         else:
@@ -518,6 +524,84 @@ class Host(BaseRoute):
         return f"{class_name}(host={self.host!r}, name={name!r}, app={self.app!r})"
 
 
+# Specificity ranks for individual path segments. Lower ranks are more
+# specific, so routes are ordered from the most to the least specific.
+_STATIC_SEGMENT = 0
+_CONVERTED_PARAM_SEGMENT = 1
+_PARAM_SEGMENT = 2
+
+
+def _segment_specificity(segment: str) -> int:
+    param_match = PARAM_REGEX.search(segment)
+    if param_match is None:
+        return _STATIC_SEGMENT
+    if param_match.group(2) is not None:
+        # A parameter with an explicit convertor, eg. "{user_id:int}".
+        return _CONVERTED_PARAM_SEGMENT
+    return _PARAM_SEGMENT
+
+
+def _specificity_path(route: BaseRoute) -> str:
+    if isinstance(route, Mount):
+        # Mounts match any path below their prefix, which behaves like
+        # a trailing "{path:path}" parameter.
+        return route.path + "/{path:path}"
+    elif isinstance(route, Host):
+        return route.host
+    path: str = getattr(route, "path", "")
+    return path
+
+
+def _route_sort_key(route: BaseRoute) -> tuple[int, ...]:
+    """
+    Return a key ordering routes from the most to the least specific.
+
+    Routes are compared segment by segment, from left to right. Static
+    segments rank above parameters, and parameters with convertors rank
+    above plain parameters. Shorter paths rank above longer ones. The
+    sort is stable, so routes with equal keys keep their registration
+    order. An explicit `match` value overrides the computed specificity.
+    """
+    match = getattr(route, "match", None)
+    if match is not None:
+        return (match,)
+    path = _specificity_path(route)
+    return tuple(_segment_specificity(segment) for segment in path.split("/") if segment)
+
+
+def _route_template(route: BaseRoute) -> str:
+    # The path pattern with any parameter names and convertors removed,
+    # eg. "/users/{user_id:int}" becomes "/users/{}". Two routes with
+    # equal templates can match the same incoming URL.
+    return PARAM_REGEX.sub("{}", _specificity_path(route))
+
+
+def _routes_overlap(route: BaseRoute, other: BaseRoute) -> bool:
+    """
+    Determine if two routes have the same specificity and path templates
+    that can both match the same incoming request, making the matching
+    order between them ambiguous.
+    """
+    if getattr(route, "match", None) is not None or getattr(other, "match", None) is not None:
+        # An explicit `match` value already disambiguates the ordering.
+        return False
+    if _route_sort_key(route) != _route_sort_key(other):
+        return False
+    if {type(route), type(other)} == {Route, WebSocketRoute}:
+        # HTTP and WebSocket routes never handle the same request.
+        return False
+    if (
+        isinstance(route, Route)
+        and isinstance(other, Route)
+        and route.methods is not None
+        and other.methods is not None
+        and route.methods.isdisjoint(other.methods)
+    ):
+        # Same path, but handling different HTTP methods.
+        return False
+    return _route_template(route) == _route_template(other)
+
+
 _T = TypeVar("_T")
 
 
@@ -576,6 +660,8 @@ class Router:
         middleware: Sequence[Middleware] | None = None,
     ) -> None:
         self.routes = [] if routes is None else list(routes)
+        self._sort_routes()
+        self._warn_on_overlapping_routes()
         self.redirect_slashes = redirect_slashes
         self.default = self.not_found if default is None else default
 
@@ -602,6 +688,24 @@ class Router:
         if middleware:
             for cls, args, kwargs in reversed(middleware):
                 self.middleware_stack = cls(self.middleware_stack, *args, **kwargs)
+
+    def _sort_routes(self) -> None:
+        # Order the routes from the most to the least specific, so that
+        # eg. "/users/me" is matched before "/users/{username}", regardless
+        # of the registration order. The sort is stable: routes with equal
+        # specificity keep their registration order.
+        self.routes.sort(key=_route_sort_key)
+
+    def _warn_on_overlapping_routes(self) -> None:
+        for index, route in enumerate(self.routes):
+            for other in self.routes[index + 1 :]:
+                if _routes_overlap(route, other):
+                    warnings.warn(
+                        f"{route!r} and {other!r} have the same specificity and overlapping path patterns. "
+                        "Which one handles a request depends on the registration order. "
+                        "Pass the 'match' argument to disambiguate them.",
+                        stacklevel=4,
+                    )
 
     async def not_found(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "websocket":
@@ -715,10 +819,12 @@ class Router:
     def mount(self, path: str, app: ASGIApp, name: str | None = None) -> None:  # pragma: no cover
         route = Mount(path, app=app, name=name)
         self.routes.append(route)
+        self._sort_routes()
 
     def host(self, host: str, app: ASGIApp, name: str | None = None) -> None:  # pragma: no cover
         route = Host(host, app=app, name=name)
         self.routes.append(route)
+        self._sort_routes()
 
     def add_route(
         self,
@@ -736,6 +842,7 @@ class Router:
             include_in_schema=include_in_schema,
         )
         self.routes.append(route)
+        self._sort_routes()
 
     def add_websocket_route(
         self,
@@ -745,3 +852,4 @@ class Router:
     ) -> None:  # pragma: no cover
         route = WebSocketRoute(path, endpoint=endpoint, name=name)
         self.routes.append(route)
+        self._sort_routes()
