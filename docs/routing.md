@@ -255,24 +255,31 @@ url = request.url_for("sub:users:user_list", subdomain=...)
 
 ## Route priority
 
-Incoming paths are matched against each `Route` in order.
-
-In cases where more that one route could match an incoming path, you should
-take care to ensure that more specific routes are listed before general cases.
-
-For example:
+Routes are automatically ordered by specificity, so that more specific routes
+are matched before more general ones, regardless of the registration order.
+Path segments are compared left-to-right: static segments rank above
+converted parameters such as `{user_id:int}`, which rank above bare
+parameters such as `{user_id}`. Routes with equal specificity keep their
+registration order.
 
 ```python
-# Don't do this: `/users/me` will never match incoming requests.
 routes = [
     Route('/users/{username}', user),
-    Route('/users/me', current_user),
+    Route('/users/me', current_user),  # Static segment, matched first.
 ]
+```
 
-# Do this: `/users/me` is tested first.
+If two routes have equal specificity and their path patterns could match the
+same URL, a warning is raised when the router is created, since which one
+matches then depends on the registration order. You can set an explicit
+ordering with the `match` argument, which is supported by `Route`,
+`WebSocketRoute` and `Mount`. Lower values are matched first, and override
+the automatically computed specificity.
+
+```python
 routes = [
-    Route('/users/me', current_user),
-    Route('/users/{username}', user),
+    Route('/users/{username}', user, match=0),  # Matched first.
+    Route('/users/me', current_user, match=1),
 ]
 ```
 

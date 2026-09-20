@@ -163,6 +163,68 @@ def compile_path(
     return re.compile(path_regex), path_format, param_convertors
 
 
+def _path_specificity(path: str) -> tuple[int, ...]:
+    """
+    Rank each segment of a path, so that more specific routes sort first:
+    static segments (0) rank above converted parameters (1), which rank
+    above bare parameters (2). Compared left-to-right, the first differing
+    segment decides, and shorter paths rank above longer ones.
+    """
+    ranks = []
+    for segment in path.split("/"):
+        if not segment:
+            continue
+        match = PARAM_REGEX.search(segment)
+        if match is None:
+            ranks.append(0)  # Static segment, e.g. "users".
+        elif match.span() == (0, len(segment)) and match.group(2) in (None, ":str"):
+            ranks.append(2)  # Bare parameter segment, e.g. "{user_id}".
+        else:
+            ranks.append(1)  # Converted parameter, e.g. "{user_id:int}", or mixed segment.
+    return tuple(ranks)
+
+
+def _route_sort_key(route: BaseRoute) -> tuple[int, tuple[int, ...]]:
+    # An explicit `match` value overrides the automatically computed
+    # specificity. Routes without one use a neutral default of 0.
+    match = getattr(route, "match", None)
+    path = getattr(route, "path", "")
+    if isinstance(route, Mount):
+        # Mounts match their path plus an implicit "/{path:path}" catch-all,
+        # so a route extending the mount's prefix is more specific.
+        path = path + "/{path:path}"
+    return (0 if match is None else match, _path_specificity(path))
+
+
+def _paths_overlap(path_a: str, path_b: str) -> bool:
+    """
+    Check if two path patterns could ever match the same URL.
+    """
+    segments_a = [segment for segment in path_a.split("/") if segment]
+    segments_b = [segment for segment in path_b.split("/") if segment]
+    if len(segments_a) != len(segments_b):
+        return False
+    for segment_a, segment_b in zip(segments_a, segments_b):
+        param_a = PARAM_REGEX.search(segment_a)
+        param_b = PARAM_REGEX.search(segment_b)
+        if param_a is None or param_b is None:
+            # A static segment only overlaps an identical static segment,
+            # or a parameter.
+            if param_a is None and param_b is None and segment_a != segment_b:
+                return False
+        elif (
+            param_a.span() == (0, len(segment_a))
+            and param_b.span() == (0, len(segment_b))
+            and param_a.group(2) not in (None, ":str")
+            and param_b.group(2) not in (None, ":str")
+            and param_a.group(2) != param_b.group(2)
+        ):
+            # Whole-segment parameters with different, non-default convertors
+            # are assumed not to overlap, e.g. "{id:int}" and "{id:uuid}".
+            return False
+    return True
+
+
 class BaseRoute:
     def matches(self, scope: Scope) -> tuple[Match, Scope]:
         raise NotImplementedError()  # pragma: no cover
@@ -203,12 +265,14 @@ class Route(BaseRoute):
         name: str | None = None,
         include_in_schema: bool = True,
         middleware: Sequence[Middleware] | None = None,
+        match: int | None = None,
     ) -> None:
         assert path.startswith("/"), "Routed paths must start with '/'"
         self.path = path
         self.endpoint = endpoint
         self.name = get_name(endpoint) if name is None else name
         self.include_in_schema = include_in_schema
+        self.match = match
 
         endpoint_handler = endpoint
         while isinstance(endpoint_handler, functools.partial):
@@ -298,11 +362,13 @@ class WebSocketRoute(BaseRoute):
         *,
         name: str | None = None,
         middleware: Sequence[Middleware] | None = None,
+        match: int | None = None,
     ) -> None:
         assert path.startswith("/"), "Routed paths must start with '/'"
         self.path = path
         self.endpoint = endpoint
         self.name = get_name(endpoint) if name is None else name
+        self.match = match
 
         endpoint_handler = endpoint
         while isinstance(endpoint_handler, functools.partial):
@@ -365,10 +431,12 @@ class Mount(BaseRoute):
         name: str | None = None,
         *,
         middleware: Sequence[Middleware] | None = None,
+        match: int | None = None,
     ) -> None:
         assert path == "" or path.startswith("/"), "Routed paths must start with '/'"
         assert app is not None or routes is not None, "Either 'app=...', or 'routes=' must be specified"
         self.path = path.rstrip("/")
+        self.match = match
         if app is not None:
             self._base_app: ASGIApp = app
         else:
@@ -576,6 +644,8 @@ class Router:
         middleware: Sequence[Middleware] | None = None,
     ) -> None:
         self.routes = [] if routes is None else list(routes)
+        self._check_overlapping_routes()
+        self._sort_routes()
         self.redirect_slashes = redirect_slashes
         self.default = self.not_found if default is None else default
 
@@ -602,6 +672,29 @@ class Router:
         if middleware:
             for cls, args, kwargs in reversed(middleware):
                 self.middleware_stack = cls(self.middleware_stack, *args, **kwargs)
+
+    def _sort_routes(self) -> None:
+        # Sort routes so that more specific ones are matched first.
+        # The sort is stable, so routes with equal specificity keep
+        # their registration order.
+        self.routes.sort(key=_route_sort_key)
+
+    def _check_overlapping_routes(self) -> None:
+        for index, route in enumerate(self.routes):
+            if not isinstance(route, (Route, WebSocketRoute, Mount)):
+                continue
+            for other in self.routes[index + 1 :]:
+                if (
+                    type(other) is type(route)
+                    and other.path != route.path
+                    and _route_sort_key(other) == _route_sort_key(route)
+                    and _paths_overlap(route.path, other.path)
+                ):
+                    warnings.warn(
+                        f"{route!r} and {other!r} have overlapping path patterns with equal "
+                        "specificity. Which one matches depends on the registration order. "
+                        "Use the 'match' argument to set an explicit ordering."
+                    )
 
     async def not_found(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "websocket":
@@ -715,6 +808,7 @@ class Router:
     def mount(self, path: str, app: ASGIApp, name: str | None = None) -> None:  # pragma: no cover
         route = Mount(path, app=app, name=name)
         self.routes.append(route)
+        self._sort_routes()
 
     def host(self, host: str, app: ASGIApp, name: str | None = None) -> None:  # pragma: no cover
         route = Host(host, app=app, name=name)
@@ -736,6 +830,7 @@ class Router:
             include_in_schema=include_in_schema,
         )
         self.routes.append(route)
+        self._sort_routes()
 
     def add_websocket_route(
         self,
@@ -745,3 +840,4 @@ class Router:
     ) -> None:  # pragma: no cover
         route = WebSocketRoute(path, endpoint=endpoint, name=name)
         self.routes.append(route)
+        self._sort_routes()

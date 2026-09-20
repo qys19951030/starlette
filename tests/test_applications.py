@@ -287,6 +287,10 @@ def test_middleware(test_client_factory: TestClientFactory) -> None:
 
 def test_routes() -> None:
     assert app.routes == [
+        Host(
+            "{subdomain}.example.org",
+            app=Router(routes=[Route("/", endpoint=custom_subdomain)]),
+        ),
         Route("/func", endpoint=func_homepage, methods=["GET"]),
         Route("/async", endpoint=async_homepage, methods=["GET"]),
         Route("/class", endpoint=Homepage),
@@ -305,10 +309,6 @@ def test_routes() -> None:
                     Route("/{username}", endpoint=user_page),
                 ]
             ),
-        ),
-        Host(
-            "{subdomain}.example.org",
-            app=Router(routes=[Route("/", endpoint=custom_subdomain)]),
         ),
     ]
 

@@ -15,7 +15,7 @@ from starlette.exceptions import HTTPException
 from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
-from starlette.routing import Host, Mount, NoMatchFound, Route, Router, WebSocketRoute
+from starlette.routing import Host, Mount, NoMatchFound, Route, Router, WebSocketRoute, _paths_overlap
 from starlette.testclient import TestClient
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from starlette.websockets import WebSocket, WebSocketDisconnect
@@ -45,7 +45,7 @@ def disable_user(request: Request) -> Response:
     return Response(content, media_type="text/plain")
 
 
-def user_no_match(request: Request) -> Response:  # pragma: no cover
+def user_no_match(request: Request) -> Response:
     content = "User fixed no match"
     return Response(content, media_type="text/plain")
 
@@ -216,7 +216,7 @@ def test_router(client: TestClient) -> None:
 
     response = client.get("/users/nomatch")
     assert response.status_code == 200
-    assert response.text == "User nomatch"
+    assert response.text == "User fixed no match"
 
     response = client.get("/static/123")
     assert response.status_code == 200
@@ -1180,3 +1180,174 @@ def test_paths_with_root_path(test_client_factory: TestClientFactory) -> None:
         "path": "/root/root-queue/path",
         "root_path": "/root",
     }
+
+
+def user_id_detail(request: Request) -> Response:
+    return Response(f"User {request.path_params['user_id']}", media_type="text/plain")
+
+
+def user_action(request: Request) -> Response:
+    return Response(f"Action {request.path_params['action']}", media_type="text/plain")
+
+
+def test_router_static_route_beats_parameter(test_client_factory: TestClientFactory) -> None:
+    # The parameter route is registered first, but the static route
+    # is more specific and should be matched first.
+    router = Router(
+        routes=[
+            Route("/users/{user_id}", endpoint=user_id_detail),
+            Route("/users/me", endpoint=user_me),
+        ]
+    )
+    client = test_client_factory(router)
+
+    response = client.get("/users/me")
+    assert response.status_code == 200
+    assert response.text == "User fixed me"
+
+    response = client.get("/users/123")
+    assert response.status_code == 200
+    assert response.text == "User 123"
+
+
+def test_router_convertor_beats_bare_parameter(test_client_factory: TestClientFactory) -> None:
+    def user_id_int(request: Request) -> Response:
+        return Response(f"Integer {request.path_params['user_id']}", media_type="text/plain")
+
+    router = Router(
+        routes=[
+            Route("/users/{action}", endpoint=user_action),
+            Route("/users/{user_id:int}", endpoint=user_id_int),
+        ]
+    )
+    client = test_client_factory(router)
+
+    response = client.get("/users/123")
+    assert response.status_code == 200
+    assert response.text == "Integer 123"
+
+    response = client.get("/users/edit")
+    assert response.status_code == 200
+    assert response.text == "Action edit"
+
+
+def test_router_equal_specificity_keeps_registration_order(test_client_factory: TestClientFactory) -> None:
+    def first(request: Request) -> Response:
+        return Response("First", media_type="text/plain")
+
+    def second(request: Request) -> Response:
+        return Response("Second", media_type="text/plain")
+
+    # Non-overlapping routes with equal specificity don't warn, and
+    # keep their registration order.
+    router = Router(
+        routes=[
+            Route("/a/{param}", endpoint=first),
+            Route("/b/{param}", endpoint=second),
+        ]
+    )
+    client = test_client_factory(router)
+    assert client.get("/a/1").text == "First"
+    assert client.get("/b/1").text == "Second"
+
+    # Overlapping routes with equal specificity warn, and the first
+    # registered one still wins.
+    with pytest.warns(UserWarning, match="overlapping path patterns"):
+        overlapping = Router(
+            routes=[
+                Route("/users/{user_id}", endpoint=first),
+                Route("/users/{name}", endpoint=second),
+            ]
+        )
+    client = test_client_factory(overlapping)
+    assert client.get("/users/tom").text == "First"
+
+
+def test_router_mount_and_route_specificity(test_client_factory: TestClientFactory) -> None:
+    def files(request: Request) -> Response:
+        return Response("Files", media_type="text/plain")
+
+    router = Router(
+        routes=[
+            Mount("/static", app=Response("Static", media_type="text/plain")),
+            Route("/static/files", endpoint=files),
+        ]
+    )
+    client = test_client_factory(router)
+
+    # The route extends the mount's prefix, so it is more specific.
+    response = client.get("/static/files")
+    assert response.status_code == 200
+    assert response.text == "Files"
+
+    # The mount still handles everything else under its prefix.
+    response = client.get("/static/other")
+    assert response.status_code == 200
+    assert response.text == "Static"
+
+
+def test_router_match_argument_overrides_specificity(test_client_factory: TestClientFactory) -> None:
+    router = Router(
+        routes=[
+            Route("/users/me", endpoint=user_me, match=1),
+            Route("/users/{user_id}", endpoint=user_id_detail, match=0),
+        ]
+    )
+    client = test_client_factory(router)
+
+    # The lower `match` value sorts first, overriding the automatic ordering.
+    response = client.get("/users/me")
+    assert response.status_code == 200
+    assert response.text == "User me"
+
+
+def test_router_websocket_route_specificity(test_client_factory: TestClientFactory) -> None:
+    async def room(session: WebSocket) -> None:
+        await session.accept()
+        await session.send_text(f"Room {session.path_params['room']}")
+        await session.close()
+
+    async def lobby(session: WebSocket) -> None:
+        await session.accept()
+        await session.send_text("Lobby")
+        await session.close()
+
+    router = Router(
+        routes=[
+            WebSocketRoute("/ws/{room}", endpoint=room),
+            WebSocketRoute("/ws/lobby", endpoint=lobby),
+        ]
+    )
+    client = test_client_factory(router)
+
+    with client.websocket_connect("/ws/lobby") as session:
+        assert session.receive_text() == "Lobby"
+
+    with client.websocket_connect("/ws/other") as session:
+        assert session.receive_text() == "Room other"
+
+
+def test_router_add_route_resorts(test_client_factory: TestClientFactory) -> None:
+    router = Router()
+    router.add_route("/users/{user_id}", endpoint=user_id_detail)
+    router.add_route("/users/me", endpoint=user_me)
+    client = test_client_factory(router)
+
+    response = client.get("/users/me")
+    assert response.status_code == 200
+    assert response.text == "User fixed me"
+
+
+def test_router_no_warning_for_distinct_convertors() -> None:
+    # Whole-segment parameters with different, non-default convertors
+    # are assumed not to overlap, so no warning is raised.
+    Router(
+        routes=[
+            Route("/users/{user_id:int}", endpoint=user_id_detail),
+            Route("/users/{user_id:uuid}", endpoint=user_id_detail),
+        ]
+    )
+
+
+def test_paths_overlap_different_lengths() -> None:
+    assert _paths_overlap("/users/{user_id}", "/users/{user_id}/posts") is False
